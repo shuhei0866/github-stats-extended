@@ -24,7 +24,7 @@ env:
   UPSTREAM_REPOSITORY: stats-organization/github-stats-extended
   MIRROR_BRANCH: release
   CANDIDATE_BRANCH: mirror-candidate
-  VERCEL_CONTEXT: Vercel – github-readme-stats
+  VERCEL_CONTEXT: Vercel
   PRODUCTION_ORIGIN: https://github-readme-stats-snf0866s-projects.vercel.app
 
 jobs:
