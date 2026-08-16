@@ -1,3 +1,9 @@
+> [!IMPORTANT]
+> This is the mirror controller branch for `shuhei0866/github-stats-extended`.
+> Production is deployed from the `release` branch, which is kept as a
+> fast-forward-only mirror of
+> [`stats-organization/github-stats-extended`](https://github.com/stats-organization/github-stats-extended/tree/release).
+
 <div align="center">
   <img src="docs/appIcon.svg" width="100px" alt="GitHub Stats Extended Logo" />
   <h1>GitHub Stats Extended</h1>

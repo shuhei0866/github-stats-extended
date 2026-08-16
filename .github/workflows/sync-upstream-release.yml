@@ -1,0 +1,318 @@
+name: Sync upstream release
+
+on:
+  schedule:
+    # 14:17 JST. Avoid the busy start-of-hour window on GitHub Actions.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      smoke_only:
+        description: Skip synchronization and test the current production deployment
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  statuses: read
+
+concurrency:
+  group: sync-upstream-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: stats-organization/github-stats-extended
+  MIRROR_BRANCH: release
+  CANDIDATE_BRANCH: mirror-candidate
+  VERCEL_CONTEXT: Vercel – github-readme-stats
+  PRODUCTION_ORIGIN: https://github-readme-stats-snf0866s-projects.vercel.app
+
+jobs:
+  prepare-candidate:
+    if: ${{ !inputs.smoke_only }}
+    permissions:
+      contents: write
+      statuses: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      changed: ${{ steps.prepare.outputs.changed }}
+      candidate_sha: ${{ steps.prepare.outputs.candidate_sha }}
+      previous_sha: ${{ steps.prepare.outputs.previous_sha }}
+      candidate_started_at: ${{ steps.prepare.outputs.candidate_started_at }}
+    steps:
+      - name: Verify upstream and update candidate
+        id: prepare
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          repo_dir="${RUNNER_TEMP}/mirror"
+          mkdir -p "${repo_dir}"
+          cd "${repo_dir}"
+
+          git init --quiet
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --quiet --no-tags origin "+refs/heads/${MIRROR_BRANCH}:refs/remotes/origin/${MIRROR_BRANCH}"
+          git fetch --quiet --no-tags upstream "+refs/heads/${MIRROR_BRANCH}:refs/remotes/upstream/${MIRROR_BRANCH}"
+
+          current_sha="$(git rev-parse "refs/remotes/origin/${MIRROR_BRANCH}")"
+          upstream_sha="$(git rev-parse "refs/remotes/upstream/${MIRROR_BRANCH}")"
+
+          echo "previous_sha=${current_sha}" >> "${GITHUB_OUTPUT}"
+          echo "candidate_sha=${upstream_sha}" >> "${GITHUB_OUTPUT}"
+
+          if [[ "${current_sha}" == "${upstream_sha}" ]]; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            echo "release is already synchronized at ${current_sha}" >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          if ! git merge-base --is-ancestor "${current_sha}" "${upstream_sha}"; then
+            echo "Refusing to update: upstream release is not a fast-forward of the mirror." >&2
+            exit 1
+          fi
+
+          branch_json="$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${UPSTREAM_REPOSITORY}/branches/${MIRROR_BRANCH}")"
+          if [[ "$(jq -r '.protected' <<<"${branch_json}")" != "true" ]]; then
+            echo "Refusing to update from an unprotected upstream release branch." >&2
+            exit 1
+          fi
+
+          commit_json="$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${UPSTREAM_REPOSITORY}/commits/${upstream_sha}")"
+          if [[ "$(jq -r '.commit.verification.verified' <<<"${commit_json}")" != "true" ]]; then
+            echo "Refusing to update to an unverified upstream commit." >&2
+            exit 1
+          fi
+
+          status_json="$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${UPSTREAM_REPOSITORY}/commits/${upstream_sha}/status")"
+          if [[ "$(jq -r '.state' <<<"${status_json}")" != "success" ]]; then
+            echo "Upstream commit status is not successful; synchronization will retry later." >&2
+            exit 1
+          fi
+
+          if git ls-remote --quiet --exit-code --heads origin "${CANDIDATE_BRANCH}" >/dev/null; then
+            git fetch --quiet --no-tags origin "+refs/heads/${CANDIDATE_BRANCH}:refs/remotes/origin/${CANDIDATE_BRANCH}"
+            candidate_current="$(git rev-parse "refs/remotes/origin/${CANDIDATE_BRANCH}")"
+            if ! git merge-base --is-ancestor "${candidate_current}" "${upstream_sha}"; then
+              echo "Refusing to rewrite the candidate branch." >&2
+              exit 1
+            fi
+          fi
+
+          candidate_started_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "candidate_started_at=${candidate_started_at}" >> "${GITHUB_OUTPUT}"
+
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --quiet origin "${upstream_sha}:refs/heads/${CANDIDATE_BRANCH}"
+
+          echo "changed=true" >> "${GITHUB_OUTPUT}"
+          {
+            echo "Candidate updated: \`${current_sha}\` → \`${upstream_sha}\`"
+            echo
+            echo "The release branch has not been changed yet."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  verify-candidate:
+    needs: prepare-candidate
+    if: ${{ needs.prepare-candidate.outputs.changed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Wait for the Vercel Preview build
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ needs.prepare-candidate.outputs.candidate_sha }}
+          STARTED_AT: ${{ needs.prepare-candidate.outputs.candidate_started_at }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for attempt in $(seq 1 60); do
+            statuses="$(curl --fail --silent --show-error \
+              --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/${CANDIDATE_SHA}/statuses?per_page=100")"
+
+            status="$(jq -c \
+              --arg context "${VERCEL_CONTEXT}" \
+              --arg started "${STARTED_AT}" \
+              '[.[] | select(.context == $context and .created_at >= $started)] | sort_by(.created_at) | last // {}' \
+              <<<"${statuses}")"
+            state="$(jq -r '.state // "missing"' <<<"${status}")"
+
+            case "${state}" in
+              success)
+                echo "Vercel Preview build succeeded." >> "${GITHUB_STEP_SUMMARY}"
+                exit 0
+                ;;
+              failure|error)
+                echo "Vercel Preview build failed: $(jq -r '.target_url // "no URL"' <<<"${status}")" >&2
+                exit 1
+                ;;
+            esac
+
+            echo "Waiting for Vercel Preview (${attempt}/60, state=${state})"
+            sleep 15
+          done
+
+          echo "Timed out waiting for the Vercel Preview build." >&2
+          exit 1
+
+  promote-release:
+    needs: [prepare-candidate, verify-candidate]
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      production_started_at: ${{ steps.promote.outputs.production_started_at }}
+    steps:
+      - name: Fast-forward production release
+        id: promote
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ needs.prepare-candidate.outputs.candidate_sha }}
+          PREVIOUS_SHA: ${{ needs.prepare-candidate.outputs.previous_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          repo_dir="${RUNNER_TEMP}/mirror"
+          mkdir -p "${repo_dir}"
+          cd "${repo_dir}"
+          git init --quiet
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --quiet --no-tags origin \
+            "+refs/heads/${MIRROR_BRANCH}:refs/remotes/origin/${MIRROR_BRANCH}" \
+            "+refs/heads/${CANDIDATE_BRANCH}:refs/remotes/origin/${CANDIDATE_BRANCH}"
+
+          release_sha="$(git rev-parse "refs/remotes/origin/${MIRROR_BRANCH}")"
+          candidate_sha="$(git rev-parse "refs/remotes/origin/${CANDIDATE_BRANCH}")"
+          if [[ "${release_sha}" != "${PREVIOUS_SHA}" ]]; then
+            echo "Release changed while validation was running; refusing to overwrite it." >&2
+            exit 1
+          fi
+          if [[ "${candidate_sha}" != "${CANDIDATE_SHA}" ]]; then
+            echo "Candidate changed while validation was running; refusing to promote it." >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "${release_sha}" "${candidate_sha}"; then
+            echo "Candidate is not a fast-forward of release." >&2
+            exit 1
+          fi
+
+          production_started_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "production_started_at=${production_started_at}" >> "${GITHUB_OUTPUT}"
+          git push --quiet origin "${candidate_sha}:refs/heads/${MIRROR_BRANCH}"
+          echo "Promoted \`${candidate_sha}\` to production release." >> "${GITHUB_STEP_SUMMARY}"
+
+  verify-production:
+    needs: [prepare-candidate, promote-release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Wait for the Vercel Production build
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_SHA: ${{ needs.prepare-candidate.outputs.candidate_sha }}
+          STARTED_AT: ${{ needs.promote-release.outputs.production_started_at }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for attempt in $(seq 1 60); do
+            statuses="$(curl --fail --silent --show-error \
+              --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/${RELEASE_SHA}/statuses?per_page=100")"
+
+            status="$(jq -c \
+              --arg context "${VERCEL_CONTEXT}" \
+              --arg started "${STARTED_AT}" \
+              '[.[] | select(.context == $context and .created_at >= $started)] | sort_by(.created_at) | last // {}' \
+              <<<"${statuses}")"
+            state="$(jq -r '.state // "missing"' <<<"${status}")"
+
+            case "${state}" in
+              success)
+                echo "Vercel Production build succeeded." >> "${GITHUB_STEP_SUMMARY}"
+                exit 0
+                ;;
+              failure|error)
+                echo "Vercel Production build failed: $(jq -r '.target_url // "no URL"' <<<"${status}")" >&2
+                exit 1
+                ;;
+            esac
+
+            echo "Waiting for Vercel Production (${attempt}/60, state=${state})"
+            sleep 15
+          done
+
+          echo "Timed out waiting for the Vercel Production build." >&2
+          exit 1
+
+      - name: Smoke-test production
+        env:
+          RELEASE_SHA: ${{ needs.prepare-candidate.outputs.candidate_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl --fail --silent --show-error \
+            --retry 3 --retry-all-errors --connect-timeout 10 --max-time 45 \
+            "${PRODUCTION_ORIGIN}/api/status/up" | grep -qx 'true'
+
+          card_file="${RUNNER_TEMP}/github-stats.svg"
+          curl --fail --silent --show-error \
+            --retry 3 --retry-all-errors --connect-timeout 10 --max-time 45 \
+            "${PRODUCTION_ORIGIN}/api?username=shuhei0866&show_icons=true&count_private=true&include_all_commits=true&mirror_check=${RELEASE_SHA}" \
+            --output "${card_file}"
+
+          grep -q '<svg' "${card_file}"
+          if grep -Eqi 'Something went wrong|Resource not accessible|Error fetching' "${card_file}"; then
+            echo "The production card contains an error response." >&2
+            exit 1
+          fi
+
+          echo "Production health and private-stat card smoke tests passed." >> "${GITHUB_STEP_SUMMARY}"
+
+  smoke-only:
+    if: ${{ inputs.smoke_only }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Smoke-test current production
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl --fail --silent --show-error \
+            --retry 3 --retry-all-errors --connect-timeout 10 --max-time 45 \
+            "${PRODUCTION_ORIGIN}/api/status/up" | grep -qx 'true'
+
+          card_file="${RUNNER_TEMP}/github-stats.svg"
+          curl --fail --silent --show-error \
+            --retry 3 --retry-all-errors --connect-timeout 10 --max-time 45 \
+            "${PRODUCTION_ORIGIN}/api?username=shuhei0866&show_icons=true&count_private=true&include_all_commits=true&mirror_check=${GITHUB_RUN_ID}" \
+            --output "${card_file}"
+
+          grep -q '<svg' "${card_file}"
+          if grep -Eqi 'Something went wrong|Resource not accessible|Error fetching' "${card_file}"; then
+            echo "The production card contains an error response." >&2
+            exit 1
+          fi
+
+          echo "Production health and private-stat card smoke tests passed." >> "${GITHUB_STEP_SUMMARY}"
