@@ -1,0 +1,61 @@
+name: Verify release runtime without deployment
+on:
+  pull_request:
+    branches: [mirror-control]
+    paths:
+      - '.github/workflows/verify-release-runtime.yml'
+permissions:
+  contents: read
+jobs:
+  container-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CANDIDATE: bb3b610cb5fd7b04c3af9d4e0ca1c0a24db263e1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: bb3b610cb5fd7b04c3af9d4e0ca1c0a24db263e1
+          persist-credentials: false
+      - name: Verify source identity and build the upstream runtime
+        run: |
+          test "$(git rev-parse HEAD)" = "$CANDIDATE"
+          test -z "$(git status --porcelain)"
+          docker build --pull -f Dockerfile.vercel --label "org.opencontainers.image.revision=$CANDIDATE" -t stats-runtime-check .
+          docker image inspect stats-runtime-check --format '{{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}}'
+          docker run --rm --network none --entrypoint node stats-runtime-check -e 'console.log(JSON.stringify({node:process.version,openssl:process.versions.openssl}));if(process.versions.node.split(".")[0]!=="24")process.exit(1)'
+      - name: Check static docs and API validation without credentials or network
+        run: |
+          docker run -d --name stats-check --network none stats-runtime-check
+          docker exec -i stats-check node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          const base='http://127.0.0.1:80';
+          let ready=false;
+          for(let i=0;i<100;i++) {
+            try {const r=await fetch(base,{redirect:'manual'});if(r.status===302){ready=true;break;}}catch{}
+            await new Promise(r=>setTimeout(r,100));
+          }
+          assert.ok(ready,'server did not start');
+          const root=await fetch(base,{redirect:'manual'});
+          assert.equal(root.status,302);
+          assert.equal(root.headers.get('location'),'/frontend/docs/');
+          const docs=await fetch(base+'/frontend/docs/');
+          assert.equal(docs.status,200);
+          assert.match(await docs.text(),/GitHub Stats Extended/);
+          for(const path of ['/api','/api/top-langs','/api/pin','/api/gist']) {
+            const r=await fetch(base+path);
+            const body=await r.text();
+            assert.equal(r.status,200,path);
+            assert.match(r.headers.get('content-type'),/image\/svg\+xml/,path);
+            assert.match(body,/<svg\b/,path);
+            assert.match(body,/Missing|missing|Please|provide|required|username|id/i,path);
+            console.log('PASS offline validation',path);
+          }
+          console.log('PASS redirect and built documentation');
+          NODE
+      - name: Diagnose failure
+        if: failure()
+        run: docker logs stats-check || true
+      - name: Remove isolated test container
+        if: always()
+        run: docker rm -f stats-check || true
